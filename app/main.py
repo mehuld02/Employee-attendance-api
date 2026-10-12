@@ -1,74 +1,287 @@
-"""
-Employee Attendance & Analytics API - STARTER
+"""Employee Attendance & Analytics API.
 
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Run: uvicorn app.main:app --port 8000
+Required environment variables: MONGO_URI, MONGO_DB
 """
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+import re
+from calendar import monthrange
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
-
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-db = client[os.getenv("MONGO_DB", "attendance_db")]
-
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
+client = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=3000)
+db = client[MONGO_DB]
 IST = timezone(timedelta(hours=5, minutes=30))
+UTC = timezone.utc
+PRESENCE = {"PRESENT", "WFH", "ON_DUTY"}
+ALL_STATUSES = {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}
+EPOCH_MIN_MS = 100_000_000_000
+EPOCH_MAX_MS = 4_102_444_800_000
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+
+@app.on_event("startup")
+def ensure_indexes():
+    db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uq_employee_code")
+    db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)], name="ix_employee_department_joined")
+    db.employees.create_index([("joined_on", ASCENDING), ("department", ASCENDING)], name="ix_employee_joined_department")
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uq_attendance_employee_date")
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="ix_attendance_date_employee")
+    db.attendance_logs.create_index([("date", ASCENDING), ("status", ASCENDING), ("emp_code", ASCENDING)], name="ix_attendance_date_status_employee")
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="ix_attendance_employee_punchin")
 
 
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+def parse_date(value: str, field: str = "date") -> date:
+    try:
+        parsed = date.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"{field} must be YYYY-MM-DD")
+    if parsed.isoformat() != value:
+        raise HTTPException(422, f"{field} must be YYYY-MM-DD")
+    return parsed
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def parse_month(value: str) -> tuple[date, date]:
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value or ""):
+        raise HTTPException(422, "month must be YYYY-MM")
+    year, month = map(int, value.split("-"))
+    first = date(year, month, 1)
+    return first, date(year, month, monthrange(year, month)[1])
 
 
-# --------------------------------------------------------------------------- #
-# Models
-# --------------------------------------------------------------------------- #
-class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+def validate_epoch_ms(value: Optional[int], field: str = "punched_at") -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not EPOCH_MIN_MS <= value <= EPOCH_MAX_MS:
+        raise HTTPException(422, f"{field} must be epoch milliseconds")
+    return value
+
+
+def from_ms(value: Optional[int]) -> Optional[datetime]:
+    if value is None:
+        return None
+    validate_epoch_ms(value)
+    return datetime.fromtimestamp(value / 1000, tz=UTC).replace(microsecond=0)
+
+
+def to_ms(value: Optional[datetime]) -> Optional[int]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)  # PyMongo naive datetimes represent UTC.
+    return int(value.timestamp() * 1000)
+
+
+def truncate_second(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).replace(microsecond=0)
+
+
+def local_datetime(day: date, shift_time: str) -> datetime:
+    hour, minute = map(int, shift_time.split(":"))
+    return datetime.combine(day, time(hour, minute), tzinfo=IST).astimezone(UTC)
+
+
+def is_overnight(emp: dict) -> bool:
+    return emp["shift_end"] <= emp["shift_start"]
+
+
+def attendance_day(punch_in: datetime, emp: dict) -> date:
+    local = punch_in.astimezone(IST)
+    day = local.date()
+    if is_overnight(emp) and local.time().replace(tzinfo=None) < time(*map(int, emp["shift_end"].split(":"))):
+        day -= timedelta(days=1)
+    return day
+
+
+def shift_start_instant(attendance_date: str, emp: dict) -> datetime:
+    return local_datetime(parse_date(attendance_date), emp["shift_start"])
+
+
+def shift_end_instant(attendance_date: str, emp: dict) -> datetime:
+    day = parse_date(attendance_date)
+    if is_overnight(emp):
+        day += timedelta(days=1)
+    return local_datetime(day, emp["shift_end"])
+
+
+def compute_late_minutes(punch_in: Optional[datetime], shift_start: str, attendance_date_value: str, emp: Optional[dict] = None) -> int:
+    if punch_in is None:
+        return 0
+    if emp is None:
+        emp = {"shift_start": shift_start, "shift_end": "18:30"}
+    start = shift_start_instant(attendance_date_value, emp)
+    minutes_seconds = int((truncate_second(punch_in) - start).total_seconds())
+    if minutes_seconds <= 600:
+        return 0
+    return max(0, minutes_seconds // 60)
+
+
+def round_half_up(value: Optional[float], places: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    quantum = Decimal("1").scaleb(-places)
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def compute_work_hours(punch_in: Optional[datetime], punch_out: Optional[datetime]) -> Optional[float]:
+    if punch_in is None or punch_out is None:
+        return None
+    seconds = int((truncate_second(punch_out) - truncate_second(punch_in)).total_seconds())
+    return round_half_up(seconds / 3600, 2)
+
+
+def compute_overtime(punch_out: Optional[datetime], attendance_date_value: str, emp: dict) -> int:
+    if punch_out is None:
+        return 0
+    end = shift_end_instant(attendance_date_value, emp)
+    seconds = int((truncate_second(punch_out) - end).total_seconds())
+    minutes = seconds // 60
+    return int(minutes) if minutes >= 30 else 0
+
+
+def working_days(start: date, end: date) -> int:
+    if end < start:
+        return 0
+    count = 0
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def output_employee(doc: dict) -> dict:
+    result = {k: v for k, v in doc.items() if k != "_id"}
+    if "created_at" in result:
+        result["created_at"] = to_ms(result["created_at"])
+    return result
+
+
+def output_attendance(doc: dict) -> dict:
+    result = {k: v for k, v in doc.items() if k != "_id"}
+    result.setdefault("late_minutes", 0)
+    result.setdefault("overtime_minutes", 0)
+    result.setdefault("half_day", False)
+    result.setdefault("history", [])
+    result.setdefault("punch_in", None)
+    result.setdefault("punch_out", None)
+    result.setdefault("work_hours", None)
+    result["punch_in"] = to_ms(result.get("punch_in"))
+    result["punch_out"] = to_ms(result.get("punch_out"))
+    for item in result["history"]:
+        item["at"] = to_ms(item.get("at"))
+        for field in ("punch_in", "punch_out"):
+            if field in item.get("changes", {}):
+                change = item["changes"][field]
+                change["from"] = to_ms(change.get("from")) if isinstance(change.get("from"), datetime) else change.get("from")
+                change["to"] = to_ms(change.get("to")) if isinstance(change.get("to"), datetime) else change.get("to")
+    return result
+
+
+def page_validate(page: int, page_size: int) -> None:
+    if page < 1 or not 1 <= page_size <= 100:
+        raise HTTPException(422, "page must be >= 1 and page_size must be between 1 and 100")
+
+
+def month_bounds_strings(month: str) -> tuple[str, str, date, date]:
+    start, end = parse_month(month)
+    return start.isoformat(), end.isoformat(), start, end
+
+
+def present_weight(doc: dict) -> float:
+    if doc.get("status") not in PRESENCE:
+        return 0.0
+    day = parse_date(doc["date"])
+    if day.weekday() >= 5:
+        return 0.0
+    return 0.5 if doc.get("half_day", False) else 1.0
+
+
+def aggregation_result(collection, pipeline):
+    return list(collection.aggregate(pipeline, allowDiskUse=True))
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class EmployeeIn(StrictModel):
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: str
 
+    @field_validator("joined_on")
+    @classmethod
+    def valid_join_date(cls, value):
+        parse_date(value, "joined_on")
+        return value
 
-class PunchInIn(BaseModel):
+    @model_validator(mode="after")
+    def different_shift_times(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+class PunchInIn(StrictModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[int] = Field(default=None, ge=EPOCH_MIN_MS, le=EPOCH_MAX_MS)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+    @field_validator("punched_at", mode="before")
+    @classmethod
+    def exact_epoch_ms(cls, value):
+        if value is not None and (type(value) is not int or not EPOCH_MIN_MS <= value <= EPOCH_MAX_MS):
+            raise ValueError("punched_at must be integer epoch milliseconds")
+        return value
 
 
-# --------------------------------------------------------------------------- #
-# Endpoints provided
-# --------------------------------------------------------------------------- #
+class PunchOutIn(StrictModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(default=None, ge=EPOCH_MIN_MS, le=EPOCH_MAX_MS)
+
+    @field_validator("punched_at", mode="before")
+    @classmethod
+    def exact_epoch_ms(cls, value):
+        if value is not None and (type(value) is not int or not EPOCH_MIN_MS <= value <= EPOCH_MAX_MS):
+            raise ValueError("punched_at must be integer epoch milliseconds")
+        return value
+
+
+class RegularizeIn(StrictModel):
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @field_validator("punch_in", "punch_out", mode="before")
+    @classmethod
+    def exact_epoch_ms(cls, value):
+        if value is not None and (type(value) is not int or not EPOCH_MIN_MS <= value <= EPOCH_MAX_MS):
+            raise ValueError("punch times must be integer epoch milliseconds or null")
+        return value
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
