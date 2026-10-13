@@ -31,9 +31,10 @@ EPOCH_MAX_MS = 4_102_444_800_000
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
 
-
+# ------------------------------- startup/indexes ---------------------------
 @app.on_event("startup")
 def ensure_indexes():
+    # Unique indexes are the concurrency guarantees, not just performance hints.
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uq_employee_code")
     db.employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)], name="ix_employee_department_joined")
     db.employees.create_index([("joined_on", ASCENDING), ("department", ASCENDING)], name="ix_employee_joined_department")
@@ -43,6 +44,7 @@ def ensure_indexes():
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="ix_attendance_employee_punchin")
 
 
+# -------------------------------- utilities --------------------------------
 def parse_date(value: str, field: str = "date") -> date:
     try:
         parsed = date.fromisoformat(value)
@@ -64,6 +66,7 @@ def parse_month(value: str) -> tuple[date, date]:
 def validate_epoch_ms(value: Optional[int], field: str = "punched_at") -> Optional[int]:
     if value is None:
         return None
+    # bool is an int subclass; reject it. Pydantic also rejects floats/strings below.
     if isinstance(value, bool) or not isinstance(value, int) or not EPOCH_MIN_MS <= value <= EPOCH_MAX_MS:
         raise HTTPException(422, f"{field} must be epoch milliseconds")
     return value
@@ -216,6 +219,7 @@ def aggregation_result(collection, pipeline):
     return list(collection.aggregate(pipeline, allowDiskUse=True))
 
 
+# ---------------------------------- models ---------------------------------
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -282,56 +286,81 @@ class RegularizeIn(StrictModel):
         return value
 
 
+# -------------------------------- endpoints -------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        client.admin.command("ping")
+        return {"status": "ok"}
+    except PyMongoError:
+        raise HTTPException(503, "MongoDB unavailable")
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(UTC).replace(microsecond=0)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return output_employee(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
-    q = {}
-    if department:
-        q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+def list_employees(department: Optional[str] = None, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    page_validate(page, page_size)
+    query = {"department": department} if department is not None else {}
+    total = db.employees.count_documents(query)
+    docs = db.employees.find(query, {"_id": 0}).sort("emp_code", ASCENDING).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [output_employee(d) for d in docs], "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    ts = truncate_second(from_ms(body.punched_at) if body.punched_at is not None else datetime.now(UTC))
+    day = attendance_day(ts, emp).isoformat()
     doc = {
-        "emp_code": body.emp_code,
-        "date": d,
-        "status": body.status,
-        "punch_in": ts,
-        "punch_out": None,
-        "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
-        "overtime_minutes": 0,
-        "half_day": False,
-        "history": [],
+        "emp_code": body.emp_code, "date": day, "status": body.status,
+        "punch_in": ts, "punch_out": None, "work_hours": None,
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], day, emp),
+        "overtime_minutes": 0, "half_day": False, "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return output_attendance(doc)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    ts = truncate_second(from_ms(body.punched_at) if body.punched_at is not None else datetime.now(UTC))
+    doc = db.attendance_logs.find_one({"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": ts}}, sort=[("punch_in", DESCENDING)])
+    if not doc:
+        raise HTTPException(404, "no punch-in found")
+    if doc.get("punch_out") is not None:
+        raise HTTPException(409, "record already punched out")
+    punch_in_dt = doc.get("punch_in")
+    if ts <= punch_in_dt or ts > punch_in_dt + timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours")
+    hours = compute_work_hours(punch_in_dt, ts)
+    overtime = compute_overtime(ts, doc["date"], emp)
+    half_day = hours is not None and hours < 4.50
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": doc["_id"], "punch_out": None},
+        {"$set": {"punch_out": ts, "work_hours": hours, "overtime_minutes": overtime, "half_day": half_day}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record already punched out")
+    return output_attendance(updated)
 
 
 @app.get("/attendance")
@@ -339,28 +368,82 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
+    page_validate(page, page_size)
+    if date_from: parse_date(date_from, "date_from")
+    if date_to: parse_date(date_to, "date_to")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must be <= date_to")
+    query = {}
+    if emp_code is not None: query["emp_code"] = emp_code
+    if status is not None: query["status"] = status
     if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+        query["date"] = {}
+        if date_from: query["date"]["$gte"] = date_from
+        if date_to: query["date"]["$lte"] = date_to
+    total = db.attendance_logs.count_documents(query)
+    docs = db.attendance_logs.find(query).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [output_attendance(d) for d in docs], "total": total, "page": page, "page_size": page_size}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: str, body: RegularizeIn):
+    parse_date(date)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    old = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not old:
+        raise HTTPException(404, "attendance record not found")
+    current_status = old.get("status")
+    current_in = old.get("punch_in")
+    current_out = old.get("punch_out")
+    new_status = body.status if body.status is not None else current_status
+    new_in = from_ms(body.punch_in) if "punch_in" in body.model_fields_set else current_in
+    new_out = from_ms(body.punch_out) if "punch_out" in body.model_fields_set else current_out
+    if new_status in {"ABSENT", "LEAVE"}:
+        if ("punch_in" in body.model_fields_set and body.punch_in is not None) or ("punch_out" in body.model_fields_set and body.punch_out is not None):
+            raise HTTPException(422, "ABSENT and LEAVE cannot have punch times")
+        new_in, new_out = None, None
+    elif new_in is None:
+        raise HTTPException(422, "presence status requires punch_in")
+    if new_in is not None:
+        new_in = truncate_second(new_in)
+        if attendance_day(new_in, emp).isoformat() != date:
+            raise HTTPException(422, "punch_in must belong to this attendance date")
+    if new_out is not None:
+        new_out = truncate_second(new_out)
+        if new_in is None or new_out <= new_in or new_out > new_in + timedelta(hours=24):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+    late = compute_late_minutes(new_in, emp["shift_start"], date, emp) if new_status in PRESENCE else 0
+    hours = compute_work_hours(new_in, new_out) if new_status in PRESENCE and new_out is not None else None
+    overtime = compute_overtime(new_out, date, emp) if new_status in PRESENCE and new_out is not None else 0
+    half = bool(hours is not None and hours < 4.50)
+    new_values = {"status": new_status, "punch_in": new_in, "punch_out": new_out, "work_hours": hours, "late_minutes": late, "overtime_minutes": overtime, "half_day": half}
+    old_values = {"status": current_status, "punch_in": old.get("punch_in"), "punch_out": old.get("punch_out"), "work_hours": old.get("work_hours"), "late_minutes": old.get("late_minutes", 0), "overtime_minutes": old.get("overtime_minutes", 0), "half_day": old.get("half_day", False)}
+    changes = {}
+    for key, new_value in new_values.items():
+        old_value = old_values.get(key)
+        if isinstance(old_value, datetime): old_value = truncate_second(old_value)
+        if isinstance(new_value, datetime): new_value = truncate_second(new_value)
+        if old_value != new_value:
+            changes[key] = {"from": old_value, "to": new_value}
+    if not changes:
+        raise HTTPException(422, "request does not change the record")
+    history_entry = {"at": datetime.now(UTC).replace(microsecond=0), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    history_filter = {"_id": old["_id"], "status": current_status, "punch_in": old.get("punch_in"), "punch_out": old.get("punch_out")}
+    # Optimistic compare-and-set: a concurrent edit loses with 409 rather than overwriting another edit.
+    if "history" in old:
+        history_filter["history"] = old["history"]
+    else:
+        history_filter["history"] = {"$exists": False}
+    result = db.attendance_logs.update_one(history_filter, {"$set": new_values, "$push": {"history": history_entry}})
+    if result.modified_count != 1:
+        raise HTTPException(409, "record changed concurrently; reload and retry")
+    updated = db.attendance_logs.find_one({"_id": old["_id"]})
+    return output_attendance(updated)
 
 
 # --------------------------------------------------------------------------- #
