@@ -26,10 +26,5 @@ uvicorn app.main:app --port 8000 --reload
 ```
 Open `http://127.0.0.1:8000/docs` for interactive API docs. `GET /health` checks MongoDB connectivity. Required indexes are created on application startup.
 
-## Important notes
-- All instants in request/response bodies are integer epoch milliseconds. MongoDB stores them as UTC BSON datetimes.
-- Employee identity is `emp_code`; MongoDB `_id` is internal and not returned.
-- Analytics are implemented as MongoDB aggregation pipelines. The trend endpoint builds a calendar series in the pipeline.
-- Run against a dedicated development database before using `sample_seed.py`, because it deletes existing `employees` and `attendance_logs` documents.
 
 
