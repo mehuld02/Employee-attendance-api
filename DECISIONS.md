@@ -1,7 +1,7 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# Design decisions
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** A unique `employees.emp_code` index enforces employee identity. A unique `(emp_code, date)` attendance index is the race-safe guarantee for one record per employee/day. Department/join-date indexes support headcount and trend queries; attendance indexes on `(emp_code, date)`, `(date, emp_code)`, and `(date, status, emp_code)` support employee-month, list, and status/date filtering. I would avoid adding every possible index because each one costs storage and slows writes.
+2. **Punch-in race.** Both requests may pass the employee lookup, but the unique attendance index permits only one insert for that `(emp_code, date)`. The winning request receives 201; MongoDB rejects the other insert and the API translates the duplicate-key error to 409.
+3. **Ties.** The leaderboard uses `$rank`, not row position. If ranks 1 and 2 are tied at the requested cutoff, every employee with rank less than or equal to the cutoff is returned, even if the result contains more rows than `limit`.
+4. **Headcount.** Department summary starts from employees who joined on or before the month end and looks up that employee's month records. An employee with no logs is preserved by the lookup/unwind logic and still contributes to headcount.
+5. **100x scale.** I would measure explain plans and latency on representative data, then consider pre-aggregated daily/monthly summaries, a background refresh strategy, and partitioning/sharding only if metrics justified the added complexity.

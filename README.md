@@ -1,26 +1,35 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + PyMongo + MongoDB API for employee records, attendance punch-in/out, manual corrections with audit history, and monthly/departments analytics.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Requirements
+- Python 3.11+
+- MongoDB 6.0+ 
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+## Local setup (Windows CMD)
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+create .env
+```
+Edit `.env` with your own `MONGO_URI` and `MONGO_DB`.
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
+Load the sample dataset into a development database:
+```bat
 python sample_seed.py
+```
+
+Run the API:
+```bat
 uvicorn app.main:app --port 8000 --reload
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+Open `http://127.0.0.1:8000/docs` for interactive API docs. `GET /health` checks MongoDB connectivity. Required indexes are created on application startup.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+## Important notes
+- All instants in request/response bodies are integer epoch milliseconds. MongoDB stores them as UTC BSON datetimes.
+- Employee identity is `emp_code`; MongoDB `_id` is internal and not returned.
+- Analytics are implemented as MongoDB aggregation pipelines. The trend endpoint builds a calendar series in the pipeline.
+- Run against a dedicated development database before using `sample_seed.py`, because it deletes existing `employees` and `attendance_logs` documents.
+
+
